@@ -1,0 +1,22 @@
+### IDEA
+.idea/
+*.iml
+out/
+
+### Java
+target/
+*.class
+*.jar
+*.war
+logs/
+
+### 前端
+frontend/node_modules
+frontend/dist
+frontend/build
+
+### 系统/缓存
+.DS_Store
+*.log
+*.tmp
+.qoder/
