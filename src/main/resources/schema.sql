@@ -95,6 +95,20 @@ CREATE TABLE cc_outcall_queue_group (
   gmt_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE cc_outcall_tenant (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  gmt_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  tenant_id VARCHAR(100) NOT NULL,
+  tenant_name VARCHAR(200),
+  tenant_type VARCHAR(20) NOT NULL DEFAULT 'NORMAL',
+  env_flag VARCHAR(20),
+  max_concurrent_slots INT,
+  enable_flag INT DEFAULT 1,
+  ext_info TEXT,
+  version BIGINT DEFAULT 0
+);
+
 -- 创建索引
 CREATE INDEX idx_task_status ON cc_outbound_call_task(task_status);
 CREATE INDEX idx_task_code ON cc_outbound_call_task(task_code);
@@ -102,6 +116,7 @@ CREATE INDEX idx_queue_status ON cc_outcall_queue(queue_status);
 CREATE INDEX idx_queue_task_code ON cc_outcall_queue(task_code);
 CREATE INDEX idx_group_status ON cc_outcall_queue_group(group_status);
 CREATE INDEX idx_group_task_code ON cc_outcall_queue_group(task_code);
+CREATE UNIQUE INDEX uk_tenant_env ON cc_outcall_tenant(tenant_id, env_flag);
 
 -- 插入一些测试数据
 INSERT INTO cc_outbound_call_task (task_code, task_name, instance_id, task_type, task_status, outbound_caller, env_flag, task_rules_code) 

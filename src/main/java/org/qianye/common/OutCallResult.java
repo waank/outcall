@@ -9,7 +9,7 @@ public class OutCallResult {
     public static final String STOP_REASON = "stopReason";
     public static final String FAIL_REASON = "failReason";
     public static final String NOT_MATCH_TIME = "notMatchTime";
-    public static final String FLOW_LIMIT = "flowLimit";
+    public static final String SLOT_LIMIT = "slotLimit";
     public static final String EXECUTE_FINISH = "executeFinish";
     public static final String MAX_RETRIES = "maxRetries";
     public static final String QUEUE_LIMIT = "queueLimit";
@@ -41,7 +41,7 @@ public class OutCallResult {
         return r;
     }
 
-    public static OutCallResult failForFlowLimit() {
-        return fail(FAIL_REASON, FLOW_LIMIT);
+    public static OutCallResult failForSlotLimit() {
+        return fail(FAIL_REASON, SLOT_LIMIT);
     }
 }

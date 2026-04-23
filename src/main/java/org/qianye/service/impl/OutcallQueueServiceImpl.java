@@ -14,11 +14,14 @@ import org.qianye.cache.CacheClient;
 import org.qianye.common.OutCallResult;
 import org.qianye.common.PageData;
 import org.qianye.common.QueueStatus;
+import org.qianye.engine.OutCallExecutorService;
+import org.qianye.engine.OutCallSlotServiceImpl;
 import org.qianye.entity.OutboundCallTaskDO;
 import org.qianye.entity.OutcallQueueDO;
 import org.qianye.mapper.OutcallQueueMapper;
 import org.qianye.service.OutboundCallTaskService;
 import org.qianye.service.OutcallQueueService;
+import org.qianye.util.CommonUtil;
 import org.qianye.util.LoggerUtil;
 import org.qianye.util.OutPlanUtil;
 import org.springframework.beans.factory.annotation.Value;
@@ -34,8 +37,14 @@ import java.util.stream.Collectors;
 @Service
 public class OutcallQueueServiceImpl extends ServiceImpl<OutcallQueueMapper, OutcallQueueDO>
         implements OutcallQueueService {
+    private static final String SLOT_RELEASED = "slotReleased";
+
     @Value("${env}")
     private String env;
+    @Value("${outcall.queue.import.batch-size:200}")
+    private int queueImportBatchSize;
+    @Value("${outcall.queue.import.max-parallelism:4}")
+    private int queueImportMaxParallelism;
     @Resource
     private CallRecordService callRecordService;
     @Resource
@@ -44,6 +53,8 @@ public class OutcallQueueServiceImpl extends ServiceImpl<OutcallQueueMapper, Out
     private OutboundCallTaskService outboundCallTaskService;
     @Resource
     private OutPlanUtil outPlanComHelper;
+    @Resource
+    private OutCallSlotServiceImpl outCallSlotService;
 
     @Override
     public QueueDetailDTO getByInstanceAndCode(String instanceId, String queueCode, String envId) {
@@ -144,6 +155,7 @@ public class OutcallQueueServiceImpl extends ServiceImpl<OutcallQueueMapper, Out
             } else {
                 outPlanComHelper.setQueueToStop(queue, OutCallResult.CALL_FAIL);
             }
+            releaseSlotIfNeeded(queue);
             LoggerUtil.info(log, "updateProcessingQueueStatusByCallRecord,instanceId:{},taskCode:{}," +
                             "processingQueue:{},updateStatus:{}", queue.getInstanceId(), queue.getTaskCode(), queue.getQueueCode(),
                     queue.getStatus());
@@ -315,6 +327,7 @@ public class OutcallQueueServiceImpl extends ServiceImpl<OutcallQueueMapper, Out
 
     private List<OutcallQueueDO> convertToDOList(List<QueueDetailDTO> batchDTOs) {
         List<OutcallQueueDO> queueDetailDOList = new ArrayList<>(batchDTOs.size());
+        Date now = new Date();
         for (QueueDetailDTO dto : batchDTOs) {
             OutcallQueueDO entity = new OutcallQueueDO();
             entity.setInstanceId(dto.getInstanceId());
@@ -325,10 +338,15 @@ public class OutcallQueueServiceImpl extends ServiceImpl<OutcallQueueMapper, Out
             entity.setCallee(dto.getCallee());
             entity.setAcid(dto.getAcid());
             entity.setCallCount(dto.getCallCount());
-            entity.setCallStartTime(dto.getCallStartTime());
-            entity.setCallEndTime(dto.getCallEndTime());
+            if (dto.getCallStartTime() != null) {
+                entity.setCallStartTime(dto.getCallStartTime());
+            }
+            if (dto.getCallEndTime() != null) {
+                entity.setCallEndTime(dto.getCallEndTime());
+            }
             entity.setEnvId(env);
-            entity.setGmtModified(new Date());
+            entity.setGmtCreate(now);
+            entity.setGmtModified(now);
             entity.setQueueStatus(dto.getStatus().name());
             entity.setExtInfo(JSONObject.toJSONString(dto.getExtInfo()));
             queueDetailDOList.add(entity);
@@ -486,34 +504,53 @@ public class OutcallQueueServiceImpl extends ServiceImpl<OutcallQueueMapper, Out
         return dto;
     }
 
+    private void releaseSlotIfNeeded(QueueDetailDTO queue) {
+        if (queue == null) {
+            return;
+        }
+        if (Boolean.TRUE.equals(queue.getExtInfo().get(SLOT_RELEASED))) {
+            return;
+        }
+        outCallSlotService.releaseSlots(queue);
+        queue.getExtInfo().put(SLOT_RELEASED, true);
+    }
+
     @Override
     public void batchInsertQueue(List<QueueDetailDTO> queueDetailDTOList) {
+        if (CollectionUtils.isEmpty(queueDetailDTOList)) {
+            LoggerUtil.warn(log, "batchInsertQueue ignored empty request");
+            return;
+        }
         LoggerUtil.info(log, "batchInsertQueueDTOList:{},{},{}", queueDetailDTOList.size(),
                 queueDetailDTOList.get(0).getInstanceId(), queueDetailDTOList.get(0).getTaskCode(),
                 JSONObject.toJSONString(queueDetailDTOList.get(0).getExtInfo()));
-        List<OutcallQueueDO> list = new ArrayList<>(queueDetailDTOList.size());
-        for (QueueDetailDTO queueDetailDto : queueDetailDTOList) {
-            OutcallQueueDO queueDetailDO = new OutcallQueueDO();
-            queueDetailDO.setEnvId(env);
-            queueDetailDO.setInstanceId(queueDetailDto.getInstanceId());
-            queueDetailDO.setQueueCode(queueDetailDto.getQueueCode());
-            queueDetailDO.setTaskCode(queueDetailDto.getTaskCode());
-            queueDetailDO.setCaller(queueDetailDto.getCaller());
-            queueDetailDO.setCallee(queueDetailDto.getCallee());
-            queueDetailDO.setAcid(queueDetailDto.getAcid());
-            queueDetailDO.setCallCount(queueDetailDto.getCallCount());
-            if (queueDetailDto.getExtInfo() != null) {
-                queueDetailDO.setExtInfo(JSONObject.toJSONString(queueDetailDto.getExtInfo()));
+        long start = System.currentTimeMillis();
+        List<OutcallQueueDO> queueDOList = convertToDOList(queueDetailDTOList);
+        int batchSize = Math.max(1, queueImportBatchSize);
+        List<List<OutcallQueueDO>> partitions = CommonUtil.partitionList(queueDOList, batchSize);
+        int parallelism = Math.max(1, Math.min(queueImportMaxParallelism, partitions.size()));
+        try {
+            for (int i = 0; i < partitions.size(); i += parallelism) {
+                List<List<OutcallQueueDO>> window = partitions.subList(i, Math.min(i + parallelism, partitions.size()));
+                CompletableFuture<?>[] futures = window.stream()
+                        .map(batch -> CompletableFuture.runAsync(() -> {
+                            int inserted = baseMapper.batchInsert(batch);
+                            if (inserted != batch.size()) {
+                                LoggerUtil.warn(log, "batchInsertQueue inserted rows mismatch, expect:{}, actual:{}, taskCode:{}",
+                                        batch.size(), inserted, batch.get(0).getTaskCode());
+                            }
+                        }, OutCallExecutorService.getImportQueueThreadPool()))
+                        .toArray(CompletableFuture[]::new);
+                CompletableFuture.allOf(futures).join();
             }
-            queueDetailDO.setQueueStatus(queueDetailDto.getStatus().name());
-            if (queueDetailDO.getCallStartTime() != null) {
-                queueDetailDO.setCallStartTime(queueDetailDto.getCallStartTime());
-            }
-            if (queueDetailDO.getCallEndTime() != null) {
-                queueDetailDO.setCallEndTime(queueDetailDto.getCallEndTime());
-            }
-            baseMapper.insert(queueDetailDO);
+        } catch (Exception e) {
+            LoggerUtil.error(log, "batchInsertQueue failed, taskCode:{}, totalSize:{}, batchSize:{}, parallelism:{}",
+                    queueDetailDTOList.get(0).getTaskCode(), queueDetailDTOList.size(), batchSize, parallelism, e);
+            throw new RuntimeException("batch insert queue failed", e);
         }
+        LoggerUtil.info(log, "batchInsertQueue completed, taskCode:{}, totalSize:{}, batchCount:{}, parallelism:{}, cost:{}ms",
+                queueDetailDTOList.get(0).getTaskCode(), queueDetailDTOList.size(), partitions.size(),
+                parallelism, System.currentTimeMillis() - start);
     }
 
     @Override

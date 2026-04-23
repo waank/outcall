@@ -12,11 +12,13 @@ import org.qianye.cache.RedisLock;
 import org.qianye.callback.OutCallBackServiceComposite;
 import org.qianye.common.*;
 import org.qianye.entity.OutboundCallTaskDO;
+import org.qianye.entity.OutcallTenantDO;
 import org.qianye.listener.OutCallEndEvent;
 import org.qianye.listener.OutCallStartEvent;
 import org.qianye.service.OutboundCallTaskService;
 import org.qianye.service.OutcallQueueGroupService;
 import org.qianye.service.OutcallQueueService;
+import org.qianye.service.OutcallTenantService;
 import org.qianye.service.impl.RemoteFsApi;
 import org.qianye.service.impl.TaskPlanService;
 import org.qianye.util.CommonUtil;
@@ -40,6 +42,7 @@ import java.util.stream.Collectors;
 @Service
 @Slf4j
 public class OutCallServiceImpl implements OutCallService {
+    private static final String TENANT_TYPE_VIP = "VIP";
     private final Map<String, AtomicBoolean> task2RunningFlag = new ConcurrentHashMap<>(16);
     @Resource
     protected CacheClient cacheClient;
@@ -56,7 +59,7 @@ public class OutCallServiceImpl implements OutCallService {
     @Resource
     private QueueGroupRedisCache groupRedisCache;
     @Resource
-    private OutCallRateLimitServiceImpl outCallRateLimitService;
+    private OutCallSlotServiceImpl outCallSlotService;
     @Resource
     private TaskPlanService taskPlanService;
     @Resource
@@ -69,6 +72,8 @@ public class OutCallServiceImpl implements OutCallService {
     private QueueGroupRedisCache queueGroupRedisCache;
     @Resource
     private InterceptTodayRecallService interceptTodayRecallService;
+    @Resource
+    private OutcallTenantService outcallTenantService;
     @Resource
     private RemoteFsApi remoteFsApi;
     private int makeCallMaxPoolSize = 160;
@@ -133,25 +138,12 @@ public class OutCallServiceImpl implements OutCallService {
         int groups = 0;
         try {
             while (!Thread.currentThread().isInterrupted()) {
-                // 控制请求速率
-                controlRequestRate();
                 updatePoolConfigIfNeeded();
-                ThreadPoolExecutor makeCallThreadPool = getThreadPoolExecutor(instanceId);
+                ThreadPoolExecutor makeCallThreadPool = selectMakeCallThreadPool(task);
                 if (makeCallThreadPool.getQueue().size() > outCallScheduleDrm.getMakeCallMaxQueueSize()) {
                     // 当前排队数过多，直接返回
                     LoggerUtil.info(log, "makeCallThreadPool queue is too large,instanceId:{},taskCode:{},queueSize:{}",
                             instanceId, taskCode, makeCallThreadPool.getQueue().size());
-                    break;
-                }
-                if (!waitForRateLimitRelease("default", task)) {
-                    // 等待下一轮再来询问，释放线程资源
-                    LoggerUtil.info(log, "waitForRateLimitRelease,waiting next call task, taskCode:{},instanceId:{}", taskCode,
-                            instanceId);
-                    long groupSize = queueGroupRedisCache.getGroupSize(taskCode, env, instanceId, false);
-                    if (groupSize == 0 && groups > 0) {
-                        eventPublisher.publishEvent(new OutCallEndEvent(task));
-                    }
-                    runningFlag.set(false);
                     break;
                 }
                 List<String> allGroups = groupRedisCache.popRightGroup(taskCode, env, instanceId, outCallScheduleDrm.getPollFirstGroupSize());
@@ -351,16 +343,6 @@ public class OutCallServiceImpl implements OutCallService {
         long currentTimeMillis = System.currentTimeMillis();
         String instanceId = queueGroupDTO.getInstanceId();
         String taskCode = queueGroupDTO.getTaskCode();
-        // 限流 时间超时10秒，跳本次队列组，更新状态为失败
-        if (!waitForRateLimitRelease(queueGroupDTO.getQueueGroupCode(), task)) {
-            // 更新组状态为失败
-            queueGroupDTO.setGroupStatus(GroupStatus.WAITING);
-            queueGroupDTO.getExtInfo().put(OutCallResult.RETRY_REASON, OutCallResult.FLOW_LIMIT);
-            int rows = queueGroupService.updateQueueGroupStatus(queueGroupDTO);
-            LoggerUtil.info(log, "waitForRateLimitRelease,groupOutCall rate limit exceeded, instanceId:{}, taskCode:{}, queueGroupCode:{},effect db row:{}",
-                    instanceId, taskCode, queueGroupDTO.getQueueGroupCode(), rows);
-            return;
-        }
         try {
             // 查询队列详情
             List<QueueDetailDTO> queueDetails = queueDetailService.getByCodes(queueGroupDTO.getInstanceId(), queueCodes);
@@ -404,12 +386,64 @@ public class OutCallServiceImpl implements OutCallService {
         }
     }
 
-    private ThreadPoolExecutor getThreadPoolExecutor(String tenantId) {
-        ThreadPoolExecutor makeCallThreadPool = OutCallExecutorService.getCommonMakeCallThreadPool();
-        if (tenantId != null && outCallScheduleDrm.getLargeOutCallTenantId().contains(tenantId)) {
-            makeCallThreadPool = OutCallExecutorService.getLargeMakeCallThreadPool();
+    private ThreadPoolExecutor selectMakeCallThreadPool(OutboundCallTaskDO task) {
+        if (isLargeTenant(task.getInstanceId()) || isLargeQueueTask(task)) {
+            return OutCallExecutorService.getLargeMakeCallThreadPool();
         }
-        return makeCallThreadPool;
+        return OutCallExecutorService.getCommonMakeCallThreadPool();
+    }
+
+    private boolean isLargeTenant(String tenantId) {
+        if (tenantId == null) {
+            return false;
+        }
+        if (outCallScheduleDrm.getLargeOutCallTenantIds().contains(tenantId)) {
+            return true;
+        }
+        try {
+            OutcallTenantDO tenantDO = outcallTenantService.getOrDefault(tenantId, env);
+            return tenantDO != null && TENANT_TYPE_VIP.equalsIgnoreCase(tenantDO.getTenantType());
+        } catch (Exception e) {
+            LoggerUtil.warn(log, "query tenant type error, tenantId:{}", tenantId, e);
+            return false;
+        }
+    }
+
+    private boolean isLargeQueueTask(OutboundCallTaskDO task) {
+        int configuredQueueCount = resolveTaskQueueCount(task);
+        if (configuredQueueCount >= outCallScheduleDrm.getLargeTaskMinQueueCount()) {
+            return true;
+        }
+        long waitingGroupSize = queueGroupRedisCache.getGroupSize(task.getTaskCode(), env, task.getInstanceId(), false)
+                + queueGroupRedisCache.getGroupSize(task.getTaskCode(), env, task.getInstanceId(), true);
+        return waitingGroupSize * Math.max(1, outCallScheduleDrm.getGroupingSize()) >= outCallScheduleDrm.getLargeTaskMinQueueCount();
+    }
+
+    private int resolveTaskQueueCount(OutboundCallTaskDO task) {
+        Map<String, Object> extInfo;
+        try {
+            extInfo = JSONObject.parseObject(task.getExtInfo(), Map.class);
+        } catch (Exception e) {
+            LoggerUtil.warn(log, "parse task extInfo error, taskCode:{}, extInfo:{}", task.getTaskCode(), task.getExtInfo(), e);
+            return 0;
+        }
+        if (extInfo == null) {
+            return 0;
+        }
+        Object value = Optional.ofNullable(extInfo.get("queueCount"))
+                .orElse(Optional.ofNullable(extInfo.get("calleeCount"))
+                        .orElse(Optional.ofNullable(extInfo.get("totalRecords")).orElse(extInfo.get("totalCount"))));
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        if (value instanceof String) {
+            try {
+                return Integer.parseInt(((String) value).trim());
+            } catch (NumberFormatException e) {
+                LoggerUtil.warn(log, "invalid task queue count, taskCode:{}, value:{}", task.getTaskCode(), value);
+            }
+        }
+        return 0;
     }
 
     /**
@@ -417,47 +451,6 @@ public class OutCallServiceImpl implements OutCallService {
      *
      * @return true-在超时时间内限流解除，false-超时仍未解除限流
      */
-    private boolean waitForRateLimitRelease(String groupCode, OutboundCallTaskDO taskDO) {
-        try {
-            long timeoutMs = outCallScheduleDrm.getRateLimitWaitingTimeSecond() * 1000;
-            long startTime = System.currentTimeMillis();
-            long remainingTimeout = timeoutMs;
-            long sleepMs = outCallScheduleDrm.getFlowLimitSleepMs();
-            int i = 1;
-            LoggerUtil.info(log, "waitForRateLimitStart,instanceId:{},taskCode:{},queueGroupCode:{},remainingTimeout:{}ms,extInfo:{}",
-                    taskDO.getInstanceId(), taskDO.getTaskCode(), groupCode, remainingTimeout, taskDO.getExtInfo());
-            while (remainingTimeout > 0) {
-                i++;
-                if (!outCallRateLimitService.isReachedRateLimit(groupCode, taskDO)) {
-                    return true; // 限流已解除
-                }
-                LoggerUtil.info(log, ",RateLimitReached, waiting...,instanceId:{}, queueGroupCode:{},remainingTimeout:{}ms",
-                        taskDO.getInstanceId(), groupCode, remainingTimeout);
-                try {
-                    Thread.sleep(sleepMs);
-                    remainingTimeout = timeoutMs - (System.currentTimeMillis() - startTime);
-                    // 休眠重新查询任务
-                    if (i > 10) {
-                        taskDO = outboundCallTaskService.queryOneCallTaskByCode(taskDO.getInstanceId(), taskDO.getTaskCode());
-                        log.info("waitForRateLimitRelease,update task,instanceId:{},taskCode:{},queueGroupCode:{},remainingTimeout:{}ms",
-                                taskDO.getInstanceId(), taskDO.getTaskCode(), groupCode, remainingTimeout);
-                        i = 1;
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    log.warn("Rate limit wait interrupted, queueGroupCode:{}", groupCode);
-                    return true;
-                }
-            }
-            log.info("RateLimitTimeout,instanceId:{}, queueGroupCode:{},", taskDO.getInstanceId(),
-                    groupCode);
-            return false; // 超时
-        } catch (Exception e) {
-            LoggerUtil.error(log, "waitForRateLimitRelease error, queueGroupCode:{}", groupCode, e);
-            return false;
-        }
-    }
-
     public void processQueuesASync(QueueGroupDTO queueGroupDTO, List<QueueDetailDTO> queues, OutboundCallTaskDO taskDO,
                                    CallTimeRange groupCallTimeRange) {
         String instanceId = queueGroupDTO.getInstanceId();
@@ -478,9 +471,9 @@ public class OutCallServiceImpl implements OutCallService {
                 instanceId, taskDO.getTaskCode(), queueGroupCode, queues.size());
         long startTime = System.currentTimeMillis();
         AtomicInteger completedTasks = new AtomicInteger(0);
+        ThreadPoolExecutor makeCallThreadPool = selectMakeCallThreadPool(taskDO);
         for (QueueDetailDTO queueDetail : queues) {
             try {
-                ThreadPoolExecutor makeCallThreadPool = getThreadPoolExecutor(instanceId);
                 if (makeCallThreadPool.getQueue().size() > outCallScheduleDrm.getMakeCallMaxQueueSize()) {
                     queueDetail.setStatus(QueueStatus.WAITING);
                     queueDetail.getExtInfo().put(OutCallResult.FAIL_REASON, OutCallResult.QUEUE_LIMIT);
@@ -593,16 +586,6 @@ public class OutCallServiceImpl implements OutCallService {
         }
     }
 
-    private void controlRequestRate() {
-        try {
-            if (outCallScheduleDrm.getRequestRateControl() > 0) {
-                Thread.sleep(outCallScheduleDrm.getRequestRateControl());
-            }
-        } catch (Exception e) {
-            log.error("controlRequestRate error", e);
-        }
-    }
-
     private void populateCallResult(QueueGroupDTO queueGroupDTO, OutCallResult callResult, QueueDetailDTO queue) {
         queue.setGroupCode(queueGroupDTO.getQueueGroupCode());
         queue.setAcid(callResult.getAcid());
@@ -651,6 +634,7 @@ public class OutCallServiceImpl implements OutCallService {
             return OutCallResult.fail(OutCallResult.FAIL_REASON, OutCallResult.STATUS_INVALID);
         }
         String lockKey = taskDO.getInstanceId() + ":" + taskDO.getTaskCode() + ":" + queue.getCallee();
+        boolean slotAcquired = false;
         try {
             String outboundCaller = getOutboundCaller(taskDO);
             LoggerUtil.info(log, "makeCall outboundCaller:{},{}", queue.getTaskCode(), outboundCaller);
@@ -665,11 +649,11 @@ public class OutCallServiceImpl implements OutCallService {
                 LoggerUtil.info(log, "makeCall tryLock fail,lockKey:{}", lockKey);
                 return OutCallResult.fail(OutCallResult.STOP_REASON, "tryLock fail");
             }
-            if (!waitForRateLimitRelease(queue.getGroupCode(), taskDO)) {
-                LoggerUtil.info(log, "waitForRateLimitRelease,makecall fail" +
-                                "instanceId:{},taskCode:{}, queueGroupCode:{},queueCode:{}",
+            slotAcquired = outCallSlotService.tryAcquireSlots(taskDO, queue);
+            if (!slotAcquired) {
+                LoggerUtil.info(log, "slotAcquireFailed,instanceId:{},taskCode:{}, queueGroupCode:{},queueCode:{}",
                         queue.getInstanceId(), queue.getTaskCode(), queue.getGroupCode(), queue.getQueueCode());
-                return OutCallResult.failForFlowLimit();
+                return OutCallResult.failForSlotLimit();
             }
             LoggerUtil.info(log, "executeMakeCall Start,instanceId:{},taskCode:{},queueCode:{}",
                     queue.getInstanceId(), queue.getTaskCode(), queue.getQueueCode());
@@ -691,7 +675,7 @@ public class OutCallServiceImpl implements OutCallService {
                 return OutCallResult.fail(OutCallResult.STOP_REASON, OutCallResult.UNKNOWN_ERROR);
             }
             if (rpcResult.getData().getFlowLimit()) {
-                return OutCallResult.failForFlowLimit();
+                return OutCallResult.failForSlotLimit();
             }
             LoggerUtil.info(log, "makeCall OutCallResult success,makeCallCoreRequest :{},groupCode:{},rpcResult:{}", makeCallCoreRequest,
                     queue.getGroupCode(), JSON.toJSONString(rpcResult));
@@ -707,6 +691,9 @@ public class OutCallServiceImpl implements OutCallService {
             LoggerUtil.error(log, e, "makeCallException, instanceId:{},taskCode:{},groupCode:{},queueCode:{},rpcResult:{} ",
                     queue.getInstanceId(), queue.getTaskCode(), queue.getGroupCode(), queue.getQueueCode());
         } finally {
+            if (slotAcquired && queue.getAcid() == null) {
+                outCallSlotService.releaseSlots(queue);
+            }
             cacheClient.delete(lockKey);
         }
         return OutCallResult.fail(OutCallResult.STOP_REASON, OutCallResult.UNKNOWN_ERROR);

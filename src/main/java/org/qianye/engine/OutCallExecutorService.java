@@ -17,6 +17,10 @@ public class OutCallExecutorService {
             10, 40, 60, TimeUnit.SECONDS,
             new LinkedBlockingQueue<>(2000), new ThreadPoolExecutor.DiscardPolicy());
     @Getter
+    private static final ThreadPoolExecutor importQueueThreadPool = new ThreadPoolExecutor(
+            4, 16, 60, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(4000), new ThreadPoolExecutor.CallerRunsPolicy());
+    @Getter
     private static final ThreadPoolExecutor retryThreadPool = new ThreadPoolExecutor(20, 40, 60, TimeUnit.SECONDS,
             new LinkedBlockingQueue<>(2000), new ThreadPoolExecutor.CallerRunsPolicy());
     @Getter
@@ -69,6 +73,15 @@ public class OutCallExecutorService {
                     , retryThreadPool.getMaximumPoolSize()
                     , retryThreadPool.getCompletedTaskCount()
                     , retryThreadPool.getQueue().size());
+            LoggerUtil.info(log,
+                    "OutCallExecutorService, thread pool status -importQueueThreadPool: ActiveCount={}, PoolSize={}, CorePoolSize={}, "
+                            + "MaximumPoolSize={}, CompletedTaskCount={}, QueueSize={}"
+                    , importQueueThreadPool.getActiveCount()
+                    , importQueueThreadPool.getPoolSize()
+                    , importQueueThreadPool.getCorePoolSize()
+                    , importQueueThreadPool.getMaximumPoolSize()
+                    , importQueueThreadPool.getCompletedTaskCount()
+                    , importQueueThreadPool.getQueue().size());
             LoggerUtil.info(log,
                     "OutCallExecutorService, thread pool status -outCallThreadPool: ActiveCount={}, PoolSize={}, CorePoolSize={}, "
                             + "MaximumPoolSize={}, CompletedTaskCount={}, QueueSize={}"
@@ -124,6 +137,7 @@ public class OutCallExecutorService {
                 Thread.currentThread().interrupt();
             }
         }
+        shutdownThreadPool(importQueueThreadPool, "importQueueThreadPool");
         shutdownThreadPool(retryThreadPool, "retryThreadPool");
         shutdownThreadPool(largeMakeCallThreadPool, "largeMakeCallThreadPool");
         shutdownThreadPool(outCallThreadPool, "outCallThreadPool");
