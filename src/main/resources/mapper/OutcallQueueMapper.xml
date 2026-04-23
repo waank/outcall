@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.qianye.mapper.OutcallQueueMapper">
+
+    <insert id="batchInsert">
+        insert into cc_outcall_queue
+        (instance_id, env_id, queue_code, caller, callee, queue_status, task_code, group_code, acid,
+         call_count, call_start_time, call_end_time, ext_info, creator, gmt_create, modifier, gmt_modified)
+        values
+        <foreach collection="list" item="item" separator=",">
+            (#{item.instanceId}, #{item.envId}, #{item.queueCode}, #{item.caller}, #{item.callee},
+             #{item.queueStatus}, #{item.taskCode}, #{item.groupCode}, #{item.acid}, #{item.callCount},
+             #{item.callStartTime}, #{item.callEndTime}, #{item.extInfo}, #{item.creator}, #{item.gmtCreate},
+             #{item.modifier}, #{item.gmtModified})
+        </foreach>
+    </insert>
+
+</mapper>
